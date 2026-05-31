@@ -5,20 +5,19 @@ Captures microphone audio in chunks and transcribes with faster-whisper.
 """
 
 import argparse
+import datetime
+import os
 import re
 import sys
+import wave
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000  # Whisper expects 16 kHz
 CHANNELS = 1
-
 VAD_FRAME_MS = 30
 VAD_FRAME_SAMPLES = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 480 samples per frame
-ENERGY_THRESHOLD = 0.01          # RMS level above which a frame is considered speech
-SILENCE_FRAMES_TO_FLUSH = 15    # ~450ms of silence closes an utterance
-MIN_SPEECH_FRAMES = 5            # ignore bursts shorter than ~150ms
 
 BOLD_GREEN = "\033[1;92m"
 RESET = "\033[0m"
@@ -45,7 +44,6 @@ def annotate_callsigns(text: str) -> str:
         return text
 
     def decode_word(w):
-        # Expand hyphens/dots within the word, then NATO-decode each sub-token
         expanded = re.sub(r'(?<=[A-Z0-9])[-.](?=[A-Z0-9])', ' ', w.upper())
         return [NATO.get(p.strip(".,!?").lower(), p.strip(".,!?")) for p in expanded.split()]
 
@@ -57,12 +55,9 @@ def annotate_callsigns(text: str) -> str:
         best_cs = None
         best_j = i + 1
 
-        # Try spans longest-first; stop as soon as we find a callsign match
         for j in range(min(i + 6, len(words)), i, -1):
             flat = [tok for k in range(i, j) for tok in decoded[k]]
 
-            # Candidate 1: collapse runs of single chars (handles NATO sequences)
-            # "K 2 T T A" -> "K2TTA"
             rejoined = " ".join(flat)
             collapsed = re.sub(
                 r'\b[A-Z0-9](?: [A-Z0-9])+\b',
@@ -70,7 +65,6 @@ def annotate_callsigns(text: str) -> str:
                 rejoined,
             ).strip()
 
-            # Candidate 2: join all tokens directly (handles "KD2"+"GI"+"Y" -> "KD2GIY")
             for candidate in (collapsed, "".join(flat)):
                 if CALLSIGN_RE.fullmatch(candidate):
                     best_cs, best_j = candidate, j
@@ -86,6 +80,18 @@ def annotate_callsigns(text: str) -> str:
             i += 1
 
     return " ".join(output)
+
+
+def save_wav(audio: np.ndarray, save_dir: str, timestamp: datetime.datetime):
+    us = f"{timestamp.microsecond:06d}"
+    filename = timestamp.strftime("hamtalk-%Y%m%d-%H%M%S.") + us + ".wav"
+    path = os.path.join(save_dir, filename)
+    audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_int16.tobytes())
 
 
 def list_devices():
@@ -112,9 +118,12 @@ def select_device(device_index: int | None) -> int:
     return default
 
 
-def transcribe_loop(device: int, model: WhisperModel):
+def transcribe_loop(device: int, model: WhisperModel, args):
     dev_name = sd.query_devices(device)["name"]
     print(f"Listening on: [{device}] {dev_name}  (Ctrl+C to stop)\n", flush=True)
+
+    if args.save:
+        os.makedirs(args.save, exist_ok=True)
 
     speech_frames = []
     silent_count = 0
@@ -127,7 +136,7 @@ def transcribe_loop(device: int, model: WhisperModel):
                 frame, _ = stream.read(VAD_FRAME_SAMPLES)
                 frame_mono = frame[:, 0]
 
-                is_speech = float(np.sqrt(np.mean(frame_mono ** 2))) > ENERGY_THRESHOLD
+                is_speech = float(np.sqrt(np.mean(frame_mono ** 2))) > args.energy_threshold
 
                 if is_speech:
                     in_speech = True
@@ -136,10 +145,16 @@ def transcribe_loop(device: int, model: WhisperModel):
                 elif in_speech:
                     silent_count += 1
                     speech_frames.append(frame_mono)
-                    if silent_count >= SILENCE_FRAMES_TO_FLUSH:
+                    if silent_count >= args.silence_frames:
                         try:
-                            if len(speech_frames) >= MIN_SPEECH_FRAMES:
+                            if len(speech_frames) >= args.min_speech_frames:
+                                now = datetime.datetime.now(datetime.timezone.utc)
+                                ts = now.strftime("%H:%M:%S")
                                 audio = np.concatenate(speech_frames)
+
+                                if args.save:
+                                    save_wav(audio, args.save, now)
+
                                 segments, _ = model.transcribe(
                                     audio,
                                     language="en",
@@ -153,7 +168,7 @@ def transcribe_loop(device: int, model: WhisperModel):
                                 ]
                                 text = " ".join(parts).strip()
                                 if text:
-                                    print(annotate_callsigns(text), flush=True)
+                                    print(f"[{ts}] {annotate_callsigns(text)}", flush=True)
                         except Exception as e:
                             print(f"[error: {e}]", file=sys.stderr, flush=True)
                         finally:
@@ -188,6 +203,22 @@ def main():
         choices=["int8", "float16", "float32"],
         help="Model compute type — int8 is fastest on CPU (default: int8)"
     )
+    parser.add_argument(
+        "--energy-threshold", type=float, default=0.01, metavar="LEVEL",
+        help="RMS energy threshold for VAD speech detection (default: 0.01)"
+    )
+    parser.add_argument(
+        "--silence-frames", type=int, default=15, metavar="N",
+        help="Silent 30ms frames before utterance flushes (default: 15 ≈ 450ms)"
+    )
+    parser.add_argument(
+        "--min-speech-frames", type=int, default=5, metavar="N",
+        help="Minimum speech frames required to transcribe (default: 5 ≈ 150ms)"
+    )
+    parser.add_argument(
+        "--save", metavar="DIRECTORY",
+        help="Save each utterance as a WAV file in this directory"
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -200,7 +231,7 @@ def main():
     model = WhisperModel(args.model, device="cpu", compute_type=args.compute_type)
     print("Model ready.", flush=True)
 
-    transcribe_loop(device, model)
+    transcribe_loop(device, model, args)
 
 
 if __name__ == "__main__":

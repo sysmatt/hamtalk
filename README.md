@@ -68,14 +68,31 @@ Run with a specific device and model:
 | `--device`, `-d` | system default | Audio input device index (see `--list-devices`) |
 | `--model`, `-m` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3` |
 | `--compute-type` | `int8` | `int8` (fastest on CPU), `float16`, `float32` |
+| `--energy-threshold` | `0.01` | RMS level above which a frame counts as speech — raise to ignore noise, lower to catch quiet speech |
+| `--silence-frames` | `15` | Silent 30ms frames before an utterance is flushed (~450ms) — raise if sentences are cut off |
+| `--min-speech-frames` | `5` | Minimum speech frames required to bother transcribing (~150ms) — raise to skip brief noise bursts |
+| `--save` | off | Directory to save each utterance as a WAV file (created if it doesn't exist) |
 | `--list-devices` | — | Print available input devices and exit |
 
-## Tuning
+## Output format
 
-If the VAD triggers on background noise, raise `ENERGY_THRESHOLD` in the script (default `0.01`).
-If it clips the start of words, lower it.
+Each transcribed line is prefixed with the UTC timestamp of when the utterance ended:
+```
+[14:32:07] CQ CQ, this is Kilo 2 Tango Tango Alpha [K2TTA]
+```
 
-If utterances are being cut off mid-sentence, raise `SILENCE_FRAMES_TO_FLUSH` (default `15` frames ≈ 450ms).
+## Saving audio
+
+```bash
+./hamtalk --save ./recordings
+```
+
+WAV files are named `hamtalk-YYYYMMDD-HHMMSS.microseconds.wav` in UTC, one file per VAD-triggered utterance:
+```
+recordings/
+  hamtalk-20260531-143207.482301.wav
+  hamtalk-20260531-143215.901442.wav
+```
 
 ## Known Limitations
 
