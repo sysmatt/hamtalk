@@ -131,6 +131,17 @@ def annotate_callsigns(text: str) -> str:
     return " ".join(output)
 
 
+def resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
+    if src_rate == SAMPLE_RATE:
+        return audio
+    target_len = int(len(audio) * SAMPLE_RATE / src_rate)
+    return np.interp(
+        np.linspace(0, len(audio) - 1, target_len),
+        np.arange(len(audio)),
+        audio,
+    ).astype(np.float32)
+
+
 def save_wav(audio: np.ndarray, save_dir: str, timestamp: datetime.datetime):
     us = f"{timestamp.microsecond:06d}"
     filename = timestamp.strftime("hamtalk-%Y%m%d-%H%M%S.") + us + ".wav"
@@ -168,7 +179,13 @@ def select_device(device_index: int | None) -> int:
 
 
 def transcribe_loop(device: int, model: WhisperModel, args):
-    dev_name = sd.query_devices(device)["name"]
+    dev_info = sd.query_devices(device)
+    dev_name = dev_info["name"]
+    capture_rate = int(dev_info["default_samplerate"])
+    capture_frame_samples = capture_rate * VAD_FRAME_MS // 1000
+
+    if capture_rate != SAMPLE_RATE:
+        print(f"Note: device native rate is {capture_rate} Hz — will resample to {SAMPLE_RATE} Hz for Whisper")
     print(f"Listening on: [{device}] {dev_name}  (Ctrl+C to stop)\n", flush=True)
 
     if args.save:
@@ -179,10 +196,10 @@ def transcribe_loop(device: int, model: WhisperModel, args):
     in_speech = False
 
     try:
-        with sd.InputStream(device=device, channels=CHANNELS, samplerate=SAMPLE_RATE,
+        with sd.InputStream(device=device, channels=CHANNELS, samplerate=capture_rate,
                             dtype="float32") as stream:
             while True:
-                frame, _ = stream.read(VAD_FRAME_SAMPLES)
+                frame, _ = stream.read(capture_frame_samples)
                 frame_mono = frame[:, 0]
 
                 is_speech = float(np.sqrt(np.mean(frame_mono ** 2))) > args.energy_threshold
@@ -199,7 +216,7 @@ def transcribe_loop(device: int, model: WhisperModel, args):
                             if len(speech_frames) >= args.min_speech_frames:
                                 now = datetime.datetime.now(datetime.timezone.utc)
                                 ts = now.strftime("%H:%M:%S")
-                                audio = np.concatenate(speech_frames)
+                                audio = resample_to_16k(np.concatenate(speech_frames), capture_rate)
 
                                 if args.save:
                                     save_wav(audio, args.save, now)
