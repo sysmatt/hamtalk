@@ -23,6 +23,7 @@ BOLD_GREEN = "\033[1;92m"
 RESET = "\033[0m"
 
 NATO = {
+    # Standard NATO phonetic alphabet
     "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D",
     "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H",
     "india": "I", "juliet": "J", "kilo": "K", "lima": "L",
@@ -30,9 +31,53 @@ NATO = {
     "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T",
     "uniform": "U", "victor": "V", "whiskey": "W", "x-ray": "X",
     "yankee": "Y", "zulu": "Z",
+    # Old ICAO "Able Baker" alphabet (pre-1956, still common on air)
+    "able": "A", "baker": "B", "dog": "D", "easy": "E",
+    "fox": "F", "george": "G", "how": "H", "item": "I",
+    "jig": "J", "king": "K", "love": "L", "nan": "N",
+    "oboe": "O", "peter": "P", "queen": "Q", "roger": "R",
+    "sugar": "S", "tare": "T", "uncle": "U", "william": "W",
+    "yoke": "Y", "zebra": "Z",
+    # Common ham radio informal/regional alternatives
+    "adam": "A", "america": "A", "apple": "A",
+    "boy": "B", "boston": "B",
+    "canada": "C",
+    "david": "D", "denver": "D",
+    "edward": "E", "england": "E",
+    "frank": "F", "frederick": "F", "florida": "F",
+    "germany": "G", "gold": "G",
+    "henry": "H", "harry": "H",
+    "ida": "I", "italy": "I",
+    "john": "J", "japan": "J",
+    "kentucky": "K",
+    "london": "L", "lincoln": "L",
+    "mary": "M", "mexico": "M", "mother": "M",
+    "nancy": "N", "norway": "N",
+    "ocean": "O", "ontario": "O", "ohio": "O",
+    "paul": "P", "paris": "P",
+    "radio": "R", "robert": "R",
+    "sam": "S", "santiago": "S",
+    "texas": "T", "tom": "T", "tommy": "T",
+    "union": "U",
+    "victoria": "V", "virginia": "V",
+    "washington": "W", "willie": "W",
+    "yellow": "Y",
 }
 
 CALLSIGN_RE = re.compile(r'\b[AKNW][A-Z]{0,2}\d[A-Z]{1,4}\b')
+
+NUMBER_WORDS = {
+    "zero": "0", "oh": "0",
+    "one": "1", "won": "1",
+    "two": "2", "to": "2", "too": "2",
+    "three": "3", "tree": "3",
+    "four": "4", "for": "4", "fore": "4",
+    "five": "5", "fife": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8", "ate": "8",
+    "nine": "9", "niner": "9",
+}
 
 
 def annotate_callsigns(text: str) -> str:
@@ -45,7 +90,11 @@ def annotate_callsigns(text: str) -> str:
 
     def decode_word(w):
         expanded = re.sub(r'(?<=[A-Z0-9])[-.](?=[A-Z0-9])', ' ', w.upper())
-        return [NATO.get(p.strip(".,!?").lower(), p.strip(".,!?")) for p in expanded.split()]
+        result = []
+        for p in expanded.split():
+            stripped = p.strip(".,!?").lower()
+            result.append(NATO.get(stripped) or NUMBER_WORDS.get(stripped) or p.strip(".,!?"))
+        return result
 
     decoded = [decode_word(w) for w in words]
     output = []
