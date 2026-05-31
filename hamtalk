@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+hamtalk — ham radio CQ exchange listener.
+Captures microphone audio in chunks and transcribes with faster-whisper.
+"""
+
+import argparse
+import re
+import sys
+import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+
+SAMPLE_RATE = 16000  # Whisper expects 16 kHz
+CHANNELS = 1
+
+VAD_FRAME_MS = 30
+VAD_FRAME_SAMPLES = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 480 samples per frame
+ENERGY_THRESHOLD = 0.01          # RMS level above which a frame is considered speech
+SILENCE_FRAMES_TO_FLUSH = 15    # ~450ms of silence closes an utterance
+MIN_SPEECH_FRAMES = 5            # ignore bursts shorter than ~150ms
+
+BOLD_GREEN = "\033[1;92m"
+RESET = "\033[0m"
+
+NATO = {
+    "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D",
+    "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H",
+    "india": "I", "juliet": "J", "kilo": "K", "lima": "L",
+    "mike": "M", "november": "N", "oscar": "O", "papa": "P",
+    "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T",
+    "uniform": "U", "victor": "V", "whiskey": "W", "x-ray": "X",
+    "yankee": "Y", "zulu": "Z",
+}
+
+CALLSIGN_RE = re.compile(r'\b[AKNW][A-Z]{0,2}\d[A-Z]{1,4}\b')
+
+
+def annotate_callsigns(text: str) -> str:
+    # Pre-expand dashes/dots between alphanumeric chars across the whole text
+    # so Whisper's "CQ-CQ-K2-TTA" becomes "CQ CQ K2 TTA" before we split
+    text = re.sub(r'(?<=[A-Za-z0-9])[-.](?=[A-Za-z0-9])', ' ', text)
+    words = text.split()
+    if not words:
+        return text
+
+    def decode_word(w):
+        # Expand hyphens/dots within the word, then NATO-decode each sub-token
+        expanded = re.sub(r'(?<=[A-Z0-9])[-.](?=[A-Z0-9])', ' ', w.upper())
+        return [NATO.get(p.strip(".,!?").lower(), p.strip(".,!?")) for p in expanded.split()]
+
+    decoded = [decode_word(w) for w in words]
+    output = []
+    i = 0
+
+    while i < len(words):
+        best_cs = None
+        best_j = i + 1
+
+        # Try spans longest-first; stop as soon as we find a callsign match
+        for j in range(min(i + 6, len(words)), i, -1):
+            flat = [tok for k in range(i, j) for tok in decoded[k]]
+
+            # Candidate 1: collapse runs of single chars (handles NATO sequences)
+            # "K 2 T T A" -> "K2TTA"
+            rejoined = " ".join(flat)
+            collapsed = re.sub(
+                r'\b[A-Z0-9](?: [A-Z0-9])+\b',
+                lambda m: m.group().replace(' ', ''),
+                rejoined,
+            ).strip()
+
+            # Candidate 2: join all tokens directly (handles "KD2"+"GI"+"Y" -> "KD2GIY")
+            for candidate in (collapsed, "".join(flat)):
+                if CALLSIGN_RE.fullmatch(candidate):
+                    best_cs, best_j = candidate, j
+                    break
+            if best_cs:
+                break
+
+        if best_cs:
+            output.append(f"{' '.join(words[i:best_j])} {BOLD_GREEN}[{best_cs}]{RESET}")
+            i = best_j
+        else:
+            output.append(words[i])
+            i += 1
+
+    return " ".join(output)
+
+
+def list_devices():
+    devices = sd.query_devices()
+    print("Available audio input devices:")
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            marker = " (default)" if i == sd.default.device[0] else ""
+            print(f"  [{i}] {dev['name']}{marker}")
+
+
+def select_device(device_index: int | None) -> int:
+    if device_index is not None:
+        info = sd.query_devices(device_index)
+        if info["max_input_channels"] < 1:
+            print(f"Error: device {device_index} has no input channels.", file=sys.stderr)
+            sys.exit(1)
+        return device_index
+
+    default = sd.default.device[0]
+    if default is None or default < 0:
+        print("Error: no default input device found. Use --device to specify one.", file=sys.stderr)
+        sys.exit(1)
+    return default
+
+
+def transcribe_loop(device: int, model: WhisperModel):
+    dev_name = sd.query_devices(device)["name"]
+    print(f"Listening on: [{device}] {dev_name}  (Ctrl+C to stop)\n", flush=True)
+
+    speech_frames = []
+    silent_count = 0
+    in_speech = False
+
+    try:
+        with sd.InputStream(device=device, channels=CHANNELS, samplerate=SAMPLE_RATE,
+                            dtype="float32") as stream:
+            while True:
+                frame, _ = stream.read(VAD_FRAME_SAMPLES)
+                frame_mono = frame[:, 0]
+
+                is_speech = float(np.sqrt(np.mean(frame_mono ** 2))) > ENERGY_THRESHOLD
+
+                if is_speech:
+                    in_speech = True
+                    silent_count = 0
+                    speech_frames.append(frame_mono)
+                elif in_speech:
+                    silent_count += 1
+                    speech_frames.append(frame_mono)
+                    if silent_count >= SILENCE_FRAMES_TO_FLUSH:
+                        try:
+                            if len(speech_frames) >= MIN_SPEECH_FRAMES:
+                                audio = np.concatenate(speech_frames)
+                                segments, _ = model.transcribe(
+                                    audio,
+                                    language="en",
+                                    beam_size=5,
+                                    condition_on_previous_text=False,
+                                )
+                                parts = [
+                                    seg.text.strip()
+                                    for seg in segments
+                                    if seg.no_speech_prob < 0.6
+                                ]
+                                text = " ".join(parts).strip()
+                                if text:
+                                    print(annotate_callsigns(text), flush=True)
+                        except Exception as e:
+                            print(f"[error: {e}]", file=sys.stderr, flush=True)
+                        finally:
+                            speech_frames = []
+                            silent_count = 0
+                            in_speech = False
+
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="hamtalk",
+        description="hamtalk — ham radio CQ exchange listener"
+    )
+    parser.add_argument(
+        "--list-devices", action="store_true",
+        help="List available audio input devices and exit"
+    )
+    parser.add_argument(
+        "--device", "-d", type=int, default=None, metavar="INDEX",
+        help="Audio input device index (default: system default)"
+    )
+    parser.add_argument(
+        "--model", "-m", default="base",
+        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        help="Whisper model size (default: base)"
+    )
+    parser.add_argument(
+        "--compute-type", default="int8",
+        choices=["int8", "float16", "float32"],
+        help="Model compute type — int8 is fastest on CPU (default: int8)"
+    )
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_devices()
+        return
+
+    device = select_device(args.device)
+
+    print(f"Loading Whisper model '{args.model}' ({args.compute_type})...", flush=True)
+    model = WhisperModel(args.model, device="cpu", compute_type=args.compute_type)
+    print("Model ready.", flush=True)
+
+    transcribe_loop(device, model)
+
+
+if __name__ == "__main__":
+    main()
